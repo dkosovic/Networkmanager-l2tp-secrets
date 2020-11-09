@@ -217,24 +217,6 @@ nm_l2tp_ipsec_error(GError **error, const char *msg) {
 }
 
 static gboolean
-has_include_ipsec_secrets (const char *ipsec_secrets_file) {
-	g_autofree char *contents = NULL;
-	g_auto(GStrv) all_lines = NULL;
-
-	if (!g_file_get_contents (ipsec_secrets_file, &contents, NULL, NULL))
-		return FALSE;
-
-	all_lines = g_strsplit (contents, "\n", 0);
-	for (int i = 0; all_lines[i]; i++) {
-		if (g_str_has_prefix (all_lines[i], "include ")) {
-			if (strstr (all_lines[i], "ipsec.d/ipsec.nm-l2tp.secrets"))
-				return TRUE;
-		}
-	}
-	return FALSE;
-}
-
-static gboolean
 validate_gateway (const char *gateway)
 {
 	const char *p = gateway;
@@ -563,28 +545,26 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 	GError *config_error = NULL;
 	NML2tpPluginPrivate *priv = NM_L2TP_PLUGIN_GET_PRIVATE (plugin);
 	NMSettingIPConfig *s_ip4;
-	const char *ipsec_secrets_file;
-	const char *ipsec_conf_dir;
 	const char *value;
 	char *filename;
-	g_autofree char *friendly_name = NULL;
-	g_autofree char *rundir;
 	char errorbuf[128];
 	gint fd = -1;
-	FILE *fp;
-	struct in_addr naddr;
 	int port;
 	int errsv;
 	gboolean l2tp_port_is_free;
 	gboolean use_ikev2;
 	gboolean tls_need_password;
-	g_autofree char *pwd_base64 = NULL;
 	const char *tls_key_filename  = NULL;
 	const char *tls_cert_filename = NULL;
 	const char *tls_ca_filename   = NULL;
 	g_autofree char *tls_key_out_filename  = NULL;
 	g_autofree char *tls_cert_out_filename = NULL;
 	g_autofree char *tls_ca_out_filename   = NULL;
+	g_autofree char *pwd_base64 = NULL;
+	g_autofree char *friendly_name = NULL;
+	g_autofree char *secretsfile = NULL;
+	g_autofree char *rundir = NULL;
+	g_autofree char *nssdir = NULL;
 	NML2tpCryptoFileFormat tls_key_fileformat  = NM_L2TP_CRYPTO_FILE_FORMAT_UNKNOWN;
 	NML2tpCryptoFileFormat tls_cert_fileformat = NM_L2TP_CRYPTO_FILE_FORMAT_UNKNOWN;
 	NML2tpCryptoFileFormat tls_ca_fileformat   = NM_L2TP_CRYPTO_FILE_FORMAT_UNKNOWN;
@@ -606,6 +586,23 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 			return FALSE;
 		}
 	}
+
+	if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_LIBRESWAN) {
+		nssdir = g_strdup_printf ("%s/nss", rundir);
+		if (!g_file_test (nssdir, G_FILE_TEST_IS_DIR)) {
+			if (mkdir (nssdir, 0700) != 0) {
+				errsv = errno;
+				g_set_error (error,
+					NM_VPN_PLUGIN_ERROR,
+					NM_VPN_PLUGIN_ERROR_BAD_ARGUMENTS,
+					"Cannot create NSS-dir %s (%s)",
+					nssdir, g_strerror (errsv));
+				return FALSE;
+			}
+		}
+	}
+
+	secretsfile = g_strdup_printf ("%s/ipsec.secrets", rundir);
 
 	/* Check that xl2tpd's default port 1701 is free */
 	l2tp_port_is_free = is_port_free (1701);
@@ -650,77 +647,19 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 			tls_key_filename = nm_setting_vpn_get_data_item (s_vpn, NM_L2TP_KEY_MACHINE_KEY);
 			tls_cert_filename = nm_setting_vpn_get_data_item (s_vpn, NM_L2TP_KEY_MACHINE_CERT);
 			tls_ca_filename = nm_setting_vpn_get_data_item (s_vpn, NM_L2TP_KEY_MACHINE_CA);
-			crypto_init_openssl();
+		}
+
+		/*
+		 * IPsec secrets
+		 */
+		fd = open (secretsfile, O_RDWR|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
+		if (fd == -1) {
+			snprintf (errorbuf, sizeof(errorbuf), _("Could not write %s"), secretsfile);
+			return nm_l2tp_ipsec_error(error, errorbuf);
 		}
 
 		if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_STRONGSWAN || priv->machine_authtype == PSK_AUTH) {
-			/*
-			 * IPsec secrets
-			 */
-			ipsec_secrets_file = NM_IPSEC_SECRETS;     /* typically /etc/ipsec.secrets */
-			ipsec_conf_dir     = NM_IPSEC_SECRETS_DIR; /* typically /etc/ipsec.d */
-			if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_STRONGSWAN) {
-				if (g_file_test ("/etc/strongswan", G_FILE_TEST_IS_DIR)) {
-					/* Fedora uses /etc/strongswan/ instead of /etc/ipsec/ */
-					ipsec_secrets_file = "/etc/strongswan/ipsec.secrets";
-					ipsec_conf_dir = "/etc/strongswan/ipsec.d";
-				}
-
-				/* if /etc/ipsec.secrets does not have "include ipsec.d/ipsec.nm-l2tp.secrets", add it */
-				if (g_file_test (ipsec_secrets_file, G_FILE_TEST_EXISTS)) {
-					if (!has_include_ipsec_secrets (ipsec_secrets_file)) {
-						fd = open (ipsec_secrets_file, O_CREAT|O_WRONLY, S_IRUSR|S_IWUSR);
-						if (fd == -1) {
-							crypto_deinit_openssl();
-							errsv = errno;
-							snprintf (errorbuf, sizeof(errorbuf),
-									  _("Could not open %s for writing: %s"),
-									  ipsec_secrets_file, g_strerror (errsv));
-							return nm_l2tp_ipsec_error(error, errorbuf);
-						}
-						fp = fdopen(fd, "a");
-						if (fp == NULL) {
-							crypto_deinit_openssl();
-							snprintf (errorbuf, sizeof(errorbuf),
-									  _("Could not append \"include ipsec.d/ipsec.nm-l2tp.secrets\" to %s"),
-									  ipsec_secrets_file);
-							return nm_l2tp_ipsec_error(error, errorbuf);
-						}
-						fprintf(fp, "\n\ninclude ipsec.d/ipsec.nm-l2tp.secrets\n");
-						fclose(fp);
-						close(fd);
-					}
-				}
-			}
-
-			filename = g_strdup_printf ("%s/ipsec.nm-l2tp.secrets", ipsec_conf_dir);
-			fd = open (filename, O_RDWR|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
-			g_free (filename);
-			if (fd == -1) {
-				snprintf (errorbuf, sizeof(errorbuf),
-						  _("Could not write %s/ipsec.nm-l2tp.secrets"),
-						  ipsec_conf_dir);
-				crypto_deinit_openssl();
-				return nm_l2tp_ipsec_error(error, errorbuf);
-			}
-
 			if (priv->machine_authtype == PSK_AUTH) {
-				value = nm_setting_vpn_get_data_item (s_vpn, NM_L2TP_KEY_IPSEC_REMOTE_ID);
-				if (value) {
-					if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_LIBRESWAN) {
-						write_config_option (fd, "%%any ");
-					}
-					/* Only literal strings starting with @ and IP addresses
-					   are allowed as IDs with IKEv1 PSK */
-					if (value[0] == '@') {
-						write_config_option (fd, "%s ", value);
-					} else if (inet_pton(AF_INET, value, &naddr)) {
-						write_config_option (fd, "%s ", value);
-					} else {
-						write_config_option (fd, "%%any ");
-					}
-				}
-
 				value = nm_setting_vpn_get_data_item (s_vpn, NM_L2TP_KEY_IPSEC_PSK);
 				if (!value) value="";
 
@@ -734,9 +673,10 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 			} else { /* TLS_AUTH */
 				if (!tls_key_filename) {
 					close(fd);
-					crypto_deinit_openssl();
 					return nm_l2tp_ipsec_error (error, _("Machine private key file not supplied"));
 				}
+
+				crypto_init_openssl();
 				tls_key_fileformat = crypto_file_format (tls_key_filename, &tls_need_password, &config_error);
 				if (config_error) {
 					close(fd);
@@ -787,14 +727,15 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 				}
 				write_config_option (fd, "\n");
 			}
-			close(fd);
 		}
+		close(fd);
 
 		/*
 		 * Libreswan NSS database
 		 */
 		if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_LIBRESWAN && priv->machine_authtype == TLS_AUTH) {
-			crypto_init_nss (NM_IPSEC_NSS_DIR, &config_error);
+			crypto_init_openssl();
+			crypto_init_nss (nssdir, &config_error);
 			if (config_error) {
 				close(fd);
 				crypto_deinit_openssl();
@@ -837,6 +778,27 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 		}
 
 		/*
+		 * Strongswan config
+		 */
+		if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_STRONGSWAN) {
+			filename = g_strdup_printf ("%s/strongswan.conf", rundir);
+			fd = open (filename, O_RDWR|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
+			g_free (filename);
+			if (fd == -1) {
+				crypto_deinit_openssl();
+				return nm_l2tp_ipsec_error(error, _("Could not write strongswan config"));
+			}
+			write_config_option (fd, "charon {\n");
+			write_config_option (fd, "\tplugins {\n");
+			write_config_option (fd, "\t\tstroke {\n");
+			write_config_option (fd, "\t\t\tsecrets_file = %s\n", secretsfile);
+			write_config_option (fd, "\t\t}\n");
+			write_config_option (fd, "\t}\n");
+			write_config_option (fd, "}\n");
+			close(fd);
+		}
+
+		/*
 		 * IPsec config
 		 */
 		filename = g_strdup_printf ("%s/ipsec.conf", rundir);
@@ -852,10 +814,12 @@ nm_l2tp_config_write (NML2tpPlugin *plugin,
 			write_config_option (fd, "config setup\n");
 			if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_LIBRESWAN) {
 				if (getenv ("PLUTODEBUG")) {
-					write_config_option (fd, "  plutodebug=\"%s\"\n\n", getenv ("PLUTODEBUG"));
+					write_config_option (fd, "  plutodebug=\"%s\"\n", getenv ("PLUTODEBUG"));
 				} else {
-					write_config_option (fd, "  plutodebug=\"all\"\n\n");
+					write_config_option (fd, "  plutodebug=\"all\"\n");
 				}
+				write_config_option (fd, "  nssdir=%s\n", nssdir);
+				write_config_option (fd, "  secretsfile=%s\n\n", secretsfile);
 			} else if (priv->ipsec_daemon == NM_L2TP_IPSEC_DAEMON_STRONGSWAN) {
 				if (getenv ("CHARONDEBUG")) {
 					write_config_option (fd, "  charondebug=\"%s\"\n\n", getenv ("CHARONDEBUG"));
@@ -1340,6 +1304,7 @@ nm_l2tp_start_ipsec(NML2tpPlugin *plugin,
 	NML2tpPluginPrivate *priv = NM_L2TP_PLUGIN_GET_PRIVATE (plugin);
 	char cmdbuf[256];
 	char *output = NULL;
+	g_autofree char *strongswan_conf_file = NULL;
 	int sys = 0, status, retry;
 	int msec;
 	gboolean rc = FALSE;
@@ -1371,6 +1336,8 @@ nm_l2tp_start_ipsec(NML2tpPlugin *plugin,
 			sys = system (cmdbuf);
 		}
 	} else {
+		strongswan_conf_file = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s/strongswan.conf", priv->uuid);
+		setenv ("STRONGSWAN_CONF", strongswan_conf_file, 1);
 		snprintf (cmdbuf, sizeof(cmdbuf), "%s status > /dev/null", priv->ipsec_binary_path);
 		sys = system (cmdbuf);
 		if (sys == 3) {
@@ -1917,7 +1884,11 @@ static gboolean
 real_disconnect (NMVpnServicePlugin *plugin, GError **err)
 {
 	char *filename;
+	char *dirname;
+	const char* item;
 	NML2tpPluginPrivate *priv = NM_L2TP_PLUGIN_GET_PRIVATE (plugin);
+	GDir *dir;
+	GError *error = NULL;
 
 	if (priv->pid_l2tpd) {
 		if (kill (priv->pid_l2tpd, SIGTERM) == 0)
@@ -1941,14 +1912,6 @@ real_disconnect (NMVpnServicePlugin *plugin, GError **err)
 
 	if (!gl.debug) {
 		/* Clean up config files */
-		filename = g_strdup_printf (NM_IPSEC_SECRETS_DIR"/ipsec.nm-l2tp.secrets");
-		unlink (filename);
-		g_free (filename);
-
-		filename = g_strdup_printf ("/etc/strongswan/ipsec.d/ipsec.nm-l2tp.secrets");
-		unlink (filename);
-		g_free (filename);
-
 		filename = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s/xl2tpd.conf", priv->uuid);
 		unlink (filename);
 		g_free (filename);
@@ -1969,9 +1932,30 @@ real_disconnect (NMVpnServicePlugin *plugin, GError **err)
 		unlink (filename);
 		g_free (filename);
 
-		filename = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s", priv->uuid);
-		rmdir (filename);
+		filename = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s/ipsec.secrets", priv->uuid);
+		unlink (filename);
 		g_free (filename);
+
+		filename = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s/strongswan.conf", priv->uuid);
+		unlink (filename);
+		g_free (filename);
+
+		dirname = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s/nss", priv->uuid);
+		dir = g_dir_open (dirname, 0, &error);
+		if (dir) {
+			while ((item = g_dir_read_name (dir))) {
+				filename = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s/nss/%s", priv->uuid, item);
+				unlink (filename);
+				g_free (filename);
+			}
+			g_dir_close (dir);
+			rmdir (dirname);
+		}
+		g_free (dirname);
+
+		dirname = g_strdup_printf (RUNSTATEDIR"/nm-l2tp-%s", priv->uuid);
+		rmdir (dirname);
+		g_free (dirname);
 	}
 
 	return TRUE;

@@ -80,26 +80,12 @@ else
 	AC_DEFINE(USE_EAPTLS, 1, [Use EAP-TLS pppd patch])
 fi
 
-AC_ARG_WITH(nm-ipsec-secrets, AS_HELP_STRING([--with-nm-ipsec-secrets=path], [The main IPSec secrets file, defaults to /etc/ipsec.secrets]), [], [with_nm_ipsec_secrets=])
-AS_IF([test -z "$with_nm_ipsec_secrets"], with_nm_ipsec_secrets="/etc/ipsec.secrets")
-if (printf '%s' "$with_nm_ipsec_secrets" | grep -v -q '^/'); then
-	AC_MSG_ERROR([--with-nm-ipsec-secrets must be an absolute path, instead it is '$with_nm_ipsec_secrets'])
+AC_ARG_WITH(strongswanddir, AS_HELP_STRING([--with-strongswanddir=path], [strongswan.d directory, defaults to /etc/strongswan.d]), [], [with_strongswanddir=])
+AS_IF([test -z "$with_strongswanddir"], with_strongswanddir="/etc/strongswan.d")
+if (printf '%s' "$with_strongswanddir" | grep -v -q '^/'); then
+	AC_MSG_ERROR([--with-strongswanddir must be an absolute path, instead it is '$with_strongswanddir'])
 fi
-AC_DEFINE_UNQUOTED(NM_IPSEC_SECRETS, "$with_nm_ipsec_secrets", [IPSec secrets file])
-
-AC_ARG_WITH(nm-ipsec-secrets-dir, AS_HELP_STRING([--with-nm-ipsec-secrets-dir=path], [The directory where to put IPSec secrets, defaults to /etc/ipsec.d/]), [], [with_nm_ipsec_secrets_dir=])
-AS_IF([test -z "$with_nm_ipsec_secrets_dir"], with_nm_ipsec_secrets_dir="/etc/ipsec.d")
-if (printf '%s' "$with_nm_ipsec_secrets_dir" | grep -v -q '^/'); then
-	AC_MSG_ERROR([--with-nm-ipsec-secrets-dir must be an absolute path, instead it is '$with_nm_ipsec_secrets_dir'])
-fi
-AC_DEFINE_UNQUOTED(NM_IPSEC_SECRETS_DIR, "$with_nm_ipsec_secrets_dir", [IPSec secret dir])
-
-AC_ARG_WITH(nm-ipsec-nss-dir, AS_HELP_STRING([--with-nm-ipsec-nss-dir=path], [The directory where Libreswan's NSS db is stored, defaults to /var/lib/ipsec/nss/]), [], [with_nm_ipsec_nss_dir=])
-AS_IF([test -z "$with_nm_ipsec_nss_dir"], with_nm_ipsec_nss_dir="/var/lib/ipsec/nss")
-if (printf '%s' "$with_nm_ipsec_nss_dir" | grep -v -q '^/'); then
-	AC_MSG_ERROR([--with-nm-ipsec-nss-dir must be an absolute path, instead it is '$with_nm_ipsec_nss_dir'])
-fi
-AC_DEFINE_UNQUOTED(NM_IPSEC_NSS_DIR, "$with_nm_ipsec_nss_dir", [Libreswan NSS db dir])
+AC_DEFINE_UNQUOTED(STRONGSWAN_D_DIR, "$with_strongswanddir", [strongswan.d dir])
 
 dnl
 dnl Checks for typedefs, structures, and compiler characteristics.
